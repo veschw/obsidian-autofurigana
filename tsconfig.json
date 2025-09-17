@@ -1,20 +1,29 @@
 {
   "compilerOptions": {
-    "baseUrl": ".",
-    "inlineSourceMap": true,
-    "inlineSources": true,
-    "module": "ESNext",
+    // Basic options
     "target": "es6",
-    "allowJs": true,
-    "noImplicitAny": true,
-    "moduleResolution": "node",
-    "importHelpers": true,
+    "module": "ESNext",
     "lib": [
       "dom",
       "es5",
       "scripthost",
       "es2020"
-    ]
+    ],
+    "allowJs": true,
+    "baseUrl": ".",
+
+    // Source map options
+    "inlineSourceMap": true,
+    "inlineSources": true,
+
+    // Module resolution options
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "importHelpers": true,
+
+    // Strictness
+    "noImplicitAny": true
   },
   "include": [
     "**/*.ts"

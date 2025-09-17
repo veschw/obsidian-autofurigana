@@ -1,151 +1,122 @@
-import { Plugin, MarkdownPostProcessor, MarkdownPostProcessorContext } from 'obsidian'
-import { RangeSetBuilder } from "@codemirror/state"
-import { ViewPlugin, WidgetType, EditorView, ViewUpdate, Decoration, DecorationSet } from '@codemirror/view'
+/**
+ * Automatic Furigana Generator for Obsidian.
+ *
+ * Entry point that wires together:
+ *  - Settings (UI + persistence)
+ *  - Kuromoji dictionary installation (one-time, cached in the vault)
+ *  - Kuromoji tokenizer initialization (patched XHR → reads dict from vault)
+ *  - Reading Mode postprocessor (DOM-based ruby rendering)
+ *  - Live Preview extension (CodeMirror 6 widget-based ruby rendering)
+ *
+ * Design notes
+ *  - Reading Mode and Live Preview can be toggled independently in settings.
+ *  - Manual override notation style is forwarded to both renderers.
+ *  - Live Preview uses a CodeMirror Compartment so the extension can be
+ *    reconfigured instantly (e.g., style changes) without reopening the file.
+ */
 
-// Regular Expression for {{kanji|kana|kana|...}} format
-const REGEXP = /{((?:[\u2E80-\uA4CF\uFF00-\uFFEF])+)((?:\\?\|[^ -\/{-~:-@\[-`]*)+)}/gm;
+import { Plugin } from 'obsidian'
 
-// Main Tags to search for Furigana Syntax
-const TAGS = 'p, h1, h2, h3, h4, h5, h6, ol, ul, table'
+import { Compartment, Extension } from '@codemirror/state'
 
-const convertFurigana = (element: Text): Node => {
-  const matches = Array.from(element.textContent.matchAll(REGEXP))
-  let lastNode = element
-  for (const match of matches) {
-    const furi = match[2].split('|').slice(1) // First Element will be empty
-    const kanji = furi.length === 1 ? [match[1]] : match[1].split('')
-    if (kanji.length === furi.length) {
-      // Number of Characters in first section must be equal to number of furigana sections (unless only one furigana section)
-      const rubyNode = document.createElement('ruby')
-      rubyNode.addClass('furi')
-      kanji.forEach((k, i) => {
-        rubyNode.appendText(k)
-        rubyNode.createEl('rt', { text: furi[i] })
-      })
-      let offset = lastNode.textContent.indexOf(match[0])
-      const nodeToReplace = lastNode.splitText(offset)
-      lastNode = nodeToReplace.splitText(match[0].length)
-      nodeToReplace.replaceWith(rubyNode)
-    }
+import { DEFAULT_SETTINGS, type PluginSettings, MyPluginSettingTab } from './settings'
+import { ensureDictInstalled } from './kuromojiDictInstaller'
+import { initializeTokenizer } from './kuromojiInit'
+import { viewPlugin } from './furiganaLivePreviewMode'
+import { createReadingModePostprocessor } from './furiganaReadingMode'
+
+/* ------------------------------------------------------------------ *
+ * The main plugin class
+ * ------------------------------------------------------------------ */
+
+export default class AutoFurigana extends Plugin {
+  settings: PluginSettings
+
+  // Compartment to allow live reconfiguration of the Live Preview extension
+  private lpCompartment = new Compartment()
+  public postprocessor = createReadingModePostprocessor(() => this.settings)
+  async loadSettings () {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData())
   }
-  return element
-}
 
-export default class MarkdownFurigana extends Plugin {
-  public postprocessor: MarkdownPostProcessor = (el: HTMLElement, ctx: MarkdownPostProcessorContext) => {
-    const blockToReplace = el.querySelectorAll(TAGS)
-    if (blockToReplace.length === 0) return
+  // Apply a partial patch, persist, then react exactly once
+  async saveSettings (patch: Partial<PluginSettings>) {
+    const prev = this.settings
+    const next = this.settings = { ...this.settings, ...patch }
+    await this.saveData(this.settings)
+    this.applySettingsChange(prev, next)
+  }
 
-    function replace(node: Node) {
-      const childrenToReplace: Text[] = []
-      node.childNodes.forEach(child => {
-        if (child.nodeType === 3) {
-          // Nodes of Type 3 are TextElements
-          childrenToReplace.push(child as Text)
-        } else if (child.hasChildNodes() && child.nodeName !== 'CODE' && child.nodeName !== 'RUBY') {
-          // Ignore content in Code Blocks
-          replace(child)
-        }
-      })
-      childrenToReplace.forEach((child) => {
-        child.replaceWith(convertFurigana(child))
-      })
-    }
-
-    blockToReplace.forEach(block => {
-      replace(block)
+  // React to a settings change by reconfiguring affected features
+  private applySettingsChange (prev: PluginSettings, next: PluginSettings) {
+    // Live Preview: reconfigure CM6 extension (enable/disable and/or change style)
+    const ext: Extension = next.editingMode ? viewPlugin(next.notationStyle) : []
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = (leaf as any).view
+      const cm = view?.editor?.cm
+      if (cm?.dispatch) {
+        cm.dispatch({ effects: this.lpCompartment.reconfigure(ext) })
+      }
     })
-  }
 
-  async onload() {
-    console.log('loading Markdown Furigana plugin')
-    this.registerMarkdownPostProcessor(this.postprocessor)
-    this.registerEditorExtension(viewPlugin)
-  }
-
-  onunload() {
-    console.log('unloading Markdown Furigana plugin')
-  }
-}
-
-class RubyWidget extends WidgetType {
-  constructor(readonly kanji: string[], readonly furi: string[]) {
-    super()
-  }
-
-  toDOM(view: EditorView): HTMLElement {
-    let ruby = document.createElement("ruby")
-    this.kanji.forEach((k, i) => {
-      ruby.appendText(k)
-      ruby.createEl("rt", { text: this.furi[i] })
-    })
-    return ruby
-  }
-}
-
-const viewPlugin = ViewPlugin.fromClass(class {
-  decorations: DecorationSet;
-
-  constructor(view: EditorView) {
-    this.decorations = this.buildDecorations(view);
-  }
-
-  update(update: ViewUpdate) {
-    if (
-      update.docChanged ||
-      update.viewportChanged ||
-      update.selectionSet
-    ) {
-      this.decorations = this.buildDecorations(update.view);
+    // Reading Mode: refresh if toggle or style changed
+    if (prev.readingMode !== next.readingMode || prev.notationStyle !== next.notationStyle) {
+      this.refreshAllReadingViews()
     }
   }
 
-  destroy() { }
-
-  buildDecorations(view: EditorView): DecorationSet {
-    let builder = new RangeSetBuilder<Decoration>();
-    let lines: number[] = [];
-    if (view.state.doc.length > 0) {
-      lines = Array.from(
-        { length: view.state.doc.lines },
-        (_, i) => i + 1,
-      );
-    }
-
-    const currentSelections = [...view.state.selection.ranges];
-
-    for (let n of lines) {
-      const line = view.state.doc.line(n);
-      const startOfLine = line.from;
-      const endOfLine = line.to;
-
-      let currentLine = false;
-
-      currentSelections.forEach((r) => {
-        if (r.to >= startOfLine && r.from <= endOfLine) {
-          currentLine = true;
-          return;
-        }
-      });
-      let matches = Array.from(line.text.matchAll(REGEXP))
-      for (const match of matches) {
-        let add = true
-        const furi = match[2].split("|").slice(1)
-        const kanji = furi.length === 1 ? [match[1]] : match[1].split("")
-        const from = match.index != undefined ? match.index + line.from : -1
-        const to = from + match[0].length
-        currentSelections.forEach((r) => {
-          if (r.to >= from && r.from <= to) {
-            add = false
-          }
-        })
-        if (add) {
-          builder.add(from, to, Decoration.widget({ widget: new RubyWidget(kanji, furi) }))
+  // Refresh all Reading Mode views by forcing a re-render
+  private refreshAllReadingViews () {
+    this.app.workspace.getLeavesOfType('markdown').forEach((leaf: any) => {
+      if (leaf.view?.getMode?.() === 'preview') {
+        if (leaf.view.previewMode?.rerender) {
+          leaf.view.previewMode.rerender(true)
+        } else if (leaf.rebuildView) {
+          leaf.rebuildView()
         }
       }
-    }
-    return builder.finish();
+    })
   }
-}, {
-  decorations: (v) => v.decorations,
-})
+
+  private reconfigureLivePreview (next: PluginSettings) {
+    const ext: Extension = next.editingMode
+      ? viewPlugin(next.notationStyle)
+      : []
+
+    // Walk every open markdown editor and dispatch the reconfigure effect.
+    this.app.workspace.iterateAllLeaves(leaf => {
+    // @ts-ignore - Obsidian's MarkdownView type
+      const mdView = leaf.view && leaf.view.getViewType && leaf.view.getViewType() === 'markdown' ? leaf.view : null
+      // @ts-ignore - editor.cm is CodeMirror6 EditorView
+      const cm = mdView?.editor?.cm
+      if (cm) cm.dispatch({ effects: this.lpCompartment.reconfigure(ext) })
+    })
+  }
+
+  async onload () {
+  // Load persisted settings
+    await this.loadSettings()
+
+    // Ensure resources needed for auto-furigana are ready
+    await ensureDictInstalled(this.app, this.manifest)
+    // spins up the worker and waits for 'ready', without long tasks on main thread.
+    await initializeTokenizer(this.app, this.manifest)
+
+    // Settings UI registered in the sidebar.
+    // Exposes toggles for Reading Mode, Live Preview, and the override notation style.
+    this.addSettingTab(new MyPluginSettingTab(this.app, this))
+
+    // Reading Mode processor registration.
+    // The postprocessor is constructed with a getter so it always sees the latest settings.
+    this.registerMarkdownPostProcessor(this.postprocessor)
+
+    // Install a Compartment so notation style or enable/disable switches can
+    // reconfigure the extension on the fly without reopening the editor.
+    const initialExt: Extension = this.settings.editingMode
+      ? viewPlugin(this.settings.notationStyle)
+      : []
+    this.registerEditorExtension(this.lpCompartment.of(initialExt))
+  }
+
+  onunload () {}
+}
