@@ -1,3 +1,7 @@
+⚠️ Status: Work in Progress  
+This plugin is under development and not ready for general use.  
+Breaking changes, incomplete features, or missing functionality are expected.  
+
 # Markdown Furigana Plugin (Obsidian)
 
 Obsidian plugin for displaying Japanese text with [furigana](https://en.wikipedia.org/wiki/Furigana).
@@ -41,3 +45,4 @@ When no manual markup is provided, furigana will be added automatically in readi
 
 * [Markdown Furigana Plugin (original by Steven Kraft)](https://github.com/steven-kraft/obsidian-markdown-furigana) – the basis for this fork.
 * [Obsidian Furigana](https://github.com/uonr/obsidian-furigana) – another plugin using ruby syntax directly in notes.
+
